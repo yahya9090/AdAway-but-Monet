@@ -1,9 +1,13 @@
-name: Build AdAway Monet APK
+name: Build Both APKs (Persistent Keys)
 
 on:
   push:
-    branches: [ "*" ]
+    branches-ignore:
+      - 'keystore-storage'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -14,6 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -22,14 +27,69 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Restore or Generate Persistent Keystores
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          mkdir -p ~/.android
+          
+          # Check if our permanent keystore branch already exists
+          if git ls-remote --exit-code --heads origin keystore-storage >/dev/null 2>&1; then
+            echo "Found existing keystores! Restoring from keystore-storage branch..."
+            git fetch origin keystore-storage
+            git checkout origin/keystore-storage -- signing.keystore debug.keystore
+            cp debug.keystore ~/.android/debug.keystore
+          else
+            echo "First run! Generating permanent Release and Debug keystores..."
+            # 1. Generate Release Keystore
+            keytool -genkey -v -keystore signing.keystore -alias adaway -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android123 -keypass android123 \
+              -dname "CN=AdAway, OU=Monet, O=Personal, L=Unknown, S=Unknown, C=US"
+            
+            # 2. Generate Debug Keystore (so Debug builds also survive updates)
+            keytool -genkey -v -keystore debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Android Debug, O=Android, C=US"
+            cp debug.keystore ~/.android/debug.keystore
+            
+            # Save both keys + a backup of this workflow to an orphan branch
+            CURRENT_BRANCH=$(git branch --show-current)
+            git checkout --orphan keystore-storage
+            git rm -rf --cached .
+            git add -f signing.keystore debug.keystore .github/workflows/build.yml
+            git commit -m "Save permanent signing keystores and workflow backup"
+            git push origin keystore-storage
+            git checkout -f "$CURRENT_BRANCH"
+            git submodule update --init --recursive
+          fi
+
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+      - name: Build Debug and Release APKs
+        run: ./gradlew assembleDebug assembleRelease --stacktrace
 
-      - name: Upload APK Artifact
+      - name: Align and Sign Release APK
+        run: |
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          UNSIGNED_APK=$(find app/build/outputs/apk/release -name "*-unsigned.apk" | head -n 1)
+          
+          if [ -n "$UNSIGNED_APK" ]; then
+            $BUILD_TOOLS/zipalign -v -p 4 "$UNSIGNED_APK" app/build/outputs/apk/release/AdAway-Monet-Release-Signed.apk
+            $BUILD_TOOLS/apksigner sign --ks signing.keystore --ks-key-alias adaway \
+              --ks-pass pass:android123 --key-pass pass:android123 \
+              app/build/outputs/apk/release/AdAway-Monet-Release-Signed.apk
+          fi
+
+      - name: Prepare Output Folder
+        run: |
+          mkdir -p output-apks
+          cp app/build/outputs/apk/debug/*.apk output-apks/AdAway-Monet-Debug.apk
+          cp app/build/outputs/apk/release/AdAway-Monet-Release-Signed.apk output-apks/AdAway-Monet-Release.apk
+
+      - name: Upload Both APKs (Debug + Release)
         uses: actions/upload-artifact@v4
         with:
-          name: AdAway-Monet-Debug-APK
-          path: app/build/outputs/apk/debug/*.apk
+          name: AdAway-Monet-Both-APKs
+          path: output-apks/*.apk
