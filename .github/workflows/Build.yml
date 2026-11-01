@@ -1,4 +1,4 @@
-name: Build Both APKs (Persistent Keys)
+name: Build APKs (Unsigned Release + Debug)
 
 on:
   push:
@@ -21,58 +21,31 @@ jobs:
           java-version: '21'
           cache: 'gradle'
 
-      - name: Generate Deterministic Persistent Keystores
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug and Optimized Unsigned Release APKs
+        run: ./gradlew assembleDebug assembleRelease -x lint -x lintVitalRelease --stacktrace
+
+      - name: Zipalign Unsigned Release APK and Collect Outputs
         run: |
-          mkdir -p ~/.android
-          cat << 'EOF' > GenKey.java
-          import java.io.*;
-          import java.security.*;
-          import sun.security.tools.keytool.Main;
+          mkdir -p output-apks
+          
+          # Copy Debug APK
+          find app/build/outputs/apk/debug -name "*.apk" -exec cp {} output-apks/AdAway-Monet-Debug.apk \;
+          
+          # Zipalign the unsigned Release APK so it's ready for local signing
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          UNSIGNED_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          
+          if [ -n "$UNSIGNED_APK" ]; then
+            $BUILD_TOOLS/zipalign -v -p 4 "$UNSIGNED_APK" output-apks/AdAway-Monet-Release-Unsigned.apk
+          fi
+          
+          ls -lh output-apks/
 
-          public class GenKey {
-              public static class SeededProvider extends Provider {
-                  public SeededProvider() {
-                      super("Seeded", 1.0, "Deterministic PRNG");
-                      put("SecureRandom.SHA1PRNG", SeededRandom.class.getName());
-                  }
-              }
-              public static class SeededRandom extends SecureRandomSpi {
-                  private final MessageDigest md;
-                  private byte[] state;
-                  private int counter = 0;
-                  public SeededRandom() {
-                      try {
-                          md = MessageDigest.getInstance("SHA-256");
-                          String seed = System.getenv("KEY_SEED");
-                          state = md.digest((seed != null ? seed : "adaway-monet").getBytes("UTF-8"));
-                      } catch (Exception e) { throw new RuntimeException(e); }
-                  }
-                  protected void engineSetSeed(byte[] seed) {}
-                  protected void engineNextBytes(byte[] bytes) {
-                      int off = 0;
-                      while (off < bytes.length) {
-                          md.update(state);
-                          md.update((byte)(counter >> 24));
-                          md.update((byte)(counter >> 16));
-                          md.update((byte)(counter >> 8));
-                          md.update((byte)counter++);
-                          byte[] out = md.digest();
-                          int len = Math.min(bytes.length - off, out.length);
-                          System.arraycopy(out, 0, bytes, off, len);
-                          off += len;
-                      }
-                  }
-                  protected byte[] engineGenerateSeed(int numBytes) {
-                      byte[] b = new byte[numBytes];
-                      engineNextBytes(b);
-                      return b;
-                  }
-              }
-              public static void main(String[] args) throws Exception {
-                  Security.insertProviderAt(new SeededProvider(), 1);
-                  Main.main(args);
-              }
-          }
-          EOF
-
-          javac --add-exports java
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdAway-Monet-APKs
+          path: output-apks/*.apk
